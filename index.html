@@ -181,15 +181,14 @@
 
     .countdown {
       width: 100%;
-      margin: .5vh 0 0;
-      overflow: hidden;
+      margin: .35vh 0 0;
       color: var(--ink);
       font-family: "Arial Black", Arial, Helvetica, sans-serif;
-      font-size: clamp(7.5rem, 22vw, 24rem);
+      font-size: clamp(8.5rem, 24vw, 28rem);
       font-variant-numeric: tabular-nums lining-nums;
       font-weight: 950;
-      letter-spacing: -.028em;
-      line-height: .88;
+      letter-spacing: .006em;
+      line-height: .84;
       text-align: center;
       text-shadow: 0 .04em .14em rgba(0,0,0,.8);
       white-space: nowrap;
@@ -1075,13 +1074,15 @@
       const heroStyles = getComputedStyle(hero);
       const heroPaddingY = (parseFloat(heroStyles.paddingTop) || 0) + (parseFloat(heroStyles.paddingBottom) || 0);
       const availableWidth = Math.max(120, hero.clientWidth - 28);
-      const availableHeight = Math.max(80, hero.clientHeight - heroPaddingY - ui.heroLabel.offsetHeight - (ui.winner.offsetHeight || 0) - 18);
+      const availableHeight = Math.max(80, hero.clientHeight - heroPaddingY - ui.heroLabel.offsetHeight - (ui.winner.offsetHeight || 0) - 8);
 
-      let size = Math.min(parseFloat(getComputedStyle(el).fontSize) || 100, availableHeight);
+      let size = parseFloat(getComputedStyle(el).fontSize) || 100;
       let guard = 0;
 
-      while ((el.scrollWidth > availableWidth || el.scrollHeight > availableHeight) && size > 36 && guard < 80) {
-        size -= 4;
+      // Zmniejszamy licznik tylko wtedy, gdy naprawdę nie mieści się w ramce.
+      // Priorytetem jest maksymalnie duża czcionka i normalny odstęp między cyframi.
+      while ((el.scrollWidth > availableWidth || el.scrollHeight > availableHeight * 1.08) && size > 36 && guard < 80) {
+        size -= 2;
         el.style.fontSize = `${size}px`;
         guard += 1;
       }
