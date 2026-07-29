@@ -130,6 +130,8 @@
       box-shadow: 0 0 0 .28em rgba(85,217,139,.12);
     }
 
+    .connection.is-hidden { display: none; }
+
     .connection.offline .connection-dot {
       background: var(--red);
       box-shadow: 0 0 0 .28em rgba(255,59,48,.14);
@@ -380,9 +382,9 @@
         <p class="event-subtitle" id="eventSubtitle">Zegar zawodów</p>
       </div>
       <div class="top-actions">
-        <div class="connection" id="connection" title="Stan połączenia z arkuszem">
+        <div class="connection is-hidden" id="connection" title="Stan połączenia z arkuszem" aria-live="polite">
           <span class="connection-dot"></span>
-          <span id="connectionText">DANE OK</span>
+          <span id="connectionText"></span>
         </div>
         <button class="fullscreen" id="fullscreenButton" type="button" aria-label="Pełny ekran" title="Pełny ekran (F)">
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -408,7 +410,7 @@
         <p class="stat-value" id="outCount">—</p>
       </article>
       <article class="stat started">
-        <p class="stat-label">Startowało</p>
+        <p class="stat-label">Wystartowało</p>
         <p class="stat-value" id="startedCount">—</p>
       </article>
     </section>
@@ -433,6 +435,8 @@
       gid: null,
 
       refreshMs: 20000,
+      requestTimeoutMs: 9000,
+      storedStateMaxAgeMs: 7 * 24 * 60 * 60 * 1000,
       fallbackLapDistanceKm: 6.706,
       fallbackEventName: "Backyard Ultra Wiewióra",
       fallbackEventSubtitle: "Zegar zawodów",
@@ -449,6 +453,7 @@
       raceStatus: ["race_status", "event_status", "status_zawodow", "status zawodów", "status zawodow"],
       lapDistance: ["lap_distance_km", "dystans_petli_km", "dystans pętli km", "dystans petli km"],
       activeLoop: ["active_loop", "aktualna_petla", "aktualna pętla", "aktualna petla"],
+      dataVersion: ["data_version", "wersja_danych", "wersja danych", "data version"],
       lastUpdate: ["last_update", "ostatnia_aktualizacja", "ostatnia aktualizacja"],
       name: ["zawodnik", "imię i nazwisko", "imie i nazwisko", "name", "runner", "athlete"],
       firstName: ["imię", "imie", "first_name", "first name"],
@@ -492,15 +497,25 @@
       started: 0,
       winner: "",
       winnerLoops: 0,
+      totalLoops: 0,
+      maxLoops: 0,
       finished: false,
       dataReady: false,
       lastSuccessMs: 0,
+      sourceVersionKind: "",
+      sourceVersionValue: null,
+      sourceVersionRaw: "",
+      sourceGid: null,
       selectedGid: CONFIG.gid
     };
 
+    const STORAGE_KEY = `bu-clock-last-good-v2-${CONFIG.sheetId}`;
+    const DEFAULT_GID_KEY = "__default__";
     let messageTimer = null;
     let refreshTimer = null;
     let wakeLock = null;
+    let refreshInFlight = false;
+    let refreshSequence = 0;
 
     function normalizeKey(value) {
       return String(value ?? "")
@@ -580,11 +595,16 @@
       return score;
     }
 
-    async function fetchText(url, timeoutMs = 9000) {
+    async function fetchText(url, timeoutMs = CONFIG.requestTimeoutMs) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+        const response = await fetch(url, {
+          cache: "no-store",
+          credentials: "omit",
+          referrerPolicy: "no-referrer",
+          signal: controller.signal
+        });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return await response.text();
       } finally {
@@ -592,45 +612,73 @@
       }
     }
 
-    function csvUrl(gid) {
-      const base = `https://docs.google.com/spreadsheets/d/e/${CONFIG.sheetId}/pub`;
-      const gidPart = gid === null || gid === undefined || gid === "" ? "" : `gid=${encodeURIComponent(gid)}&single=true&`;
-      return `${base}?${gidPart}output=csv&_=${Date.now()}`;
+    function normalizeGidKey(gid) {
+      return gid === null || gid === undefined || gid === "" ? DEFAULT_GID_KEY : String(gid);
     }
 
-    async function discoverGids() {
+    function gidForRequest(gid) {
+      return gid === DEFAULT_GID_KEY ? null : gid;
+    }
+
+    function csvUrl(gid, requestId = 0) {
+      const requestGid = gidForRequest(gid);
+      const base = `https://docs.google.com/spreadsheets/d/e/${CONFIG.sheetId}/pub`;
+      const gidPart = requestGid === null || requestGid === undefined || requestGid === "" ? "" : `gid=${encodeURIComponent(requestGid)}&single=true&`;
+      const nonce = `${Date.now()}-${requestId}-${Math.random().toString(36).slice(2)}`;
+      return `${base}?${gidPart}output=csv&cache_bust=${encodeURIComponent(nonce)}`;
+    }
+
+    async function discoverGids(requestId) {
       const gids = [];
       const add = value => {
         const v = String(value ?? "").trim();
         if (/^\d+$/.test(v) && !gids.includes(v)) gids.push(v);
       };
 
+      // Najpierw ostatnio poprawnie używana zakładka. Adres bez gid jest dopiero rezerwą.
       add(CONFIG.gid);
       add(state.selectedGid);
       add(localStorage.getItem(`bu-clock-gid-${CONFIG.sheetId}`));
       add("0");
 
       try {
-        const html = await fetchText(`https://docs.google.com/spreadsheets/d/e/${CONFIG.sheetId}/pubhtml?_=${Date.now()}`, 7000);
+        const nonce = `${Date.now()}-${requestId}-${Math.random().toString(36).slice(2)}`;
+        const html = await fetchText(`https://docs.google.com/spreadsheets/d/e/${CONFIG.sheetId}/pubhtml?cache_bust=${encodeURIComponent(nonce)}`, 7000);
         for (const match of html.matchAll(/(?:gid=|gid%3D|"gid"\s*:\s*")(\d+)/g)) add(match[1]);
       } catch (error) {
         console.info("Nie udało się odczytać listy zakładek. Używam podstawowych adresów.", error);
       }
 
-      return [null, ...gids];
+      return [...gids, null];
     }
 
-    async function loadRecords() {
-      const gids = await discoverGids();
+    async function readSheet(gid, requestId) {
+      const text = await fetchText(csvUrl(gid, requestId));
+      const records = parseCSV(text);
+      return { records, score: scoreCSV(records), gid };
+    }
+
+    async function loadRecords(requestId) {
+      // Po pierwszym trafieniu nie odpytujemy co 20 sekund kilku adresów Google.
+      // Czytamy tylko zapamiętany gid. Inne adresy są używane wyłącznie po błędzie.
+      if (state.selectedGid !== null && state.selectedGid !== undefined && state.selectedGid !== "") {
+        try {
+          const direct = await readSheet(state.selectedGid, requestId);
+          if (direct.score >= 10 && direct.records.length) return direct;
+        } catch (error) {
+          console.info("Bezpośredni odczyt zapamiętanej zakładki nie udał się.", error);
+        }
+      }
+
+      const gids = await discoverGids(requestId);
       let best = { score: -1, records: [], gid: null };
 
       for (const gid of gids) {
         try {
-          const text = await fetchText(csvUrl(gid));
-          const records = parseCSV(text);
-          const score = scoreCSV(records);
-          if (score > best.score) best = { score, records, gid };
-          if (score >= 21) break;
+          const candidate = await readSheet(gid, requestId);
+          const explicitGidWinsTie = candidate.score === best.score && candidate.gid !== null && best.gid === null;
+          if (candidate.score > best.score || explicitGidWinsTie) best = candidate;
+          if (candidate.score >= 21) break;
         } catch (error) {
           console.info("Nie udało się pobrać zakładki", gid, error);
         }
@@ -640,9 +688,10 @@
         throw new Error("Nie znaleziono zakładki z wynikami. Ustaw CONFIG.gid na gid zakładki WYNIKI_HTML.");
       }
 
-      state.selectedGid = best.gid;
+      const selectedKey = normalizeGidKey(best.gid);
+      state.selectedGid = selectedKey;
       if (best.gid !== null) localStorage.setItem(`bu-clock-gid-${CONFIG.sheetId}`, String(best.gid));
-      return best.records;
+      return { ...best, gid: selectedKey };
     }
 
     function parseNumber(value) {
@@ -704,6 +753,36 @@
       return Number.isFinite(parsed) ? parsed : NaN;
     }
 
+    function parseSourceVersion(records) {
+      const explicitRaw = String(getMeta(records, ALIASES.dataVersion) ?? "").trim();
+      const updateRaw = String(getMeta(records, ALIASES.lastUpdate) ?? "").trim();
+      const raw = explicitRaw || updateRaw;
+      if (!raw) return { kind: "", value: null, raw: "" };
+
+      const normalizedNumber = Number(raw.replace(/\s/g, "").replace(",", "."));
+      if (Number.isFinite(normalizedNumber)) {
+        if (normalizedNumber > 1e12) return { kind: "time", value: normalizedNumber, raw };
+        if (normalizedNumber > 1e9) return { kind: "time", value: normalizedNumber * 1000, raw };
+        if (normalizedNumber > 20000 && normalizedNumber < 100000) {
+          return { kind: "time", value: sheetSerialToLocalMs(normalizedNumber), raw };
+        }
+        return { kind: "counter", value: normalizedNumber, raw };
+      }
+
+      const parsedDate = parseDate(raw);
+      if (Number.isFinite(parsedDate)) return { kind: "time", value: parsedDate, raw };
+      return { kind: "text", value: raw, raw };
+    }
+
+    function compareVersions(candidate, current) {
+      if (!candidate?.kind || candidate.value === null || candidate.value === undefined) return null;
+      if (!current?.kind || current.value === null || current.value === undefined) return 1;
+      if (candidate.kind !== current.kind) return null;
+      if (candidate.value === current.value) return 0;
+      if (candidate.kind === "text") return null;
+      return candidate.value > current.value ? 1 : -1;
+    }
+
     function normalizeStatus(value) {
       const status = String(value ?? "").trim().toUpperCase().replace(/\s+/g, "_");
       if (["RUNNING", "ACTIVE", "AKTYWNY", "BIEGNIE"].includes(status)) return "RUN";
@@ -744,6 +823,7 @@
       }));
 
       const startMs = parseDate(getMeta(records, ALIASES.raceStart));
+      const sourceVersion = parseSourceVersion(records);
       const statusText = normalizeStatus(getMeta(records, ALIASES.raceStatus));
       const explicitEndMs = parseDate(getMeta(records, ALIASES.raceEnd));
       const lastUpdateMs = parseDate(getMeta(records, ALIASES.lastUpdate));
@@ -764,6 +844,7 @@
       }
 
       const lapDistance = parseNumber(getMeta(records, ALIASES.lapDistance));
+      const totalLoops = runners.reduce((sum, runner) => sum + runner.loops, 0);
       const maxLoops = runners.reduce((max, runner) => Math.max(max, runner.loops), 0);
       const endMs = Number.isFinite(explicitEndMs)
         ? explicitEndMs
@@ -782,9 +863,14 @@
         started: nonDns.length,
         winner: anyWinner?.name || "",
         winnerLoops: anyWinner?.loops || maxLoops,
+        totalLoops,
+        maxLoops,
         finished,
         dataReady: true,
-        lastSuccessMs: Date.now()
+        lastSuccessMs: Date.now(),
+        sourceVersionKind: sourceVersion.kind,
+        sourceVersionValue: sourceVersion.value,
+        sourceVersionRaw: sourceVersion.raw
       };
     }
 
@@ -802,10 +888,115 @@
         started: 77,
         winner: "",
         winnerLoops: 0,
+        totalLoops: 7 * 73,
+        maxLoops: 7,
         finished: false,
         dataReady: true,
-        lastSuccessMs: Date.now()
+        lastSuccessMs: Date.now(),
+        sourceVersionKind: "counter",
+        sourceVersionValue: 1,
+        sourceVersionRaw: "demo"
       };
+    }
+
+    function persistLastGoodState() {
+      try {
+        const snapshot = {
+          savedAtMs: Date.now(),
+          startMs: state.startMs,
+          endMs: state.endMs,
+          lapDistanceKm: state.lapDistanceKm,
+          eventName: state.eventName,
+          eventSubtitle: state.eventSubtitle,
+          active: state.active,
+          out: state.out,
+          started: state.started,
+          winner: state.winner,
+          winnerLoops: state.winnerLoops,
+          totalLoops: state.totalLoops,
+          maxLoops: state.maxLoops,
+          finished: state.finished,
+          dataReady: state.dataReady,
+          lastSuccessMs: state.lastSuccessMs,
+          sourceVersionKind: state.sourceVersionKind,
+          sourceVersionValue: state.sourceVersionValue,
+          sourceVersionRaw: state.sourceVersionRaw,
+          sourceGid: state.sourceGid,
+          selectedGid: state.selectedGid
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+      } catch (error) {
+        console.info("Nie udało się zapisać ostatniego poprawnego stanu.", error);
+      }
+    }
+
+    function restoreLastGoodState() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return false;
+        const snapshot = JSON.parse(raw);
+        if (!snapshot || !Number.isFinite(snapshot.savedAtMs)) return false;
+        if (Date.now() - snapshot.savedAtMs > CONFIG.storedStateMaxAgeMs) return false;
+        state = { ...state, ...snapshot, dataReady: true };
+        return true;
+      } catch (error) {
+        console.info("Nie udało się odczytać ostatniego poprawnego stanu.", error);
+        return false;
+      }
+    }
+
+    function shouldAcceptCandidate(candidate, requestId, sourceGid) {
+      // Starsze wywołanie nigdy nie może nadpisać nowszego.
+      if (requestId !== refreshSequence) return false;
+
+      const candidateVersion = {
+        kind: candidate.sourceVersionKind,
+        value: candidate.sourceVersionValue
+      };
+      const currentVersion = {
+        kind: state.sourceVersionKind,
+        value: state.sourceVersionValue
+      };
+      const versionOrder = compareVersions(candidateVersion, currentVersion);
+
+      // Twarda blokada cofnięcia po data_version / last_update.
+      if (versionOrder === -1) {
+        console.warn("Odrzucono starszą wersję danych:", candidate.sourceVersionRaw, "<", state.sourceVersionRaw);
+        setConnection(false, "STARE DANE POMINIĘTE");
+        return false;
+      }
+
+      // Po przyjęciu wersjonowanych danych odpowiedź bez wersji nie może ich zastąpić.
+      if (state.sourceVersionKind && !candidate.sourceVersionKind) {
+        console.warn("Odrzucono odpowiedź bez wersji danych.");
+        setConnection(false, "BRAK WERSJI DANYCH");
+        return false;
+      }
+
+      // Gdy źródło nie daje wersji albo zwróciło tę samą wersję, blokujemy również
+      // oczywiste cofnięcie przebiegu zawodów. Nowsza wersja nadal może wykonać korektę wstecz.
+      if (state.dataReady && versionOrder !== 1) {
+        const obviousRegression =
+          candidate.started < state.started ||
+          candidate.totalLoops < state.totalLoops ||
+          candidate.maxLoops < state.maxLoops ||
+          (candidate.out < state.out && candidate.active > state.active);
+
+        if (obviousRegression) {
+          console.warn("Odrzucono dane cofające przebieg zawodów.");
+          setConnection(false, "STARE DANE POMINIĘTE");
+          return false;
+        }
+      }
+
+      // Po ustaleniu źródła inny adres może być użyty tylko, gdy nie mamy jeszcze danych.
+      if (state.dataReady && state.sourceGid !== null && sourceGid !== state.sourceGid) {
+        console.warn("Odrzucono dane z innego gid niż ostatnio zaakceptowany.");
+        setConnection(false, "INNE ŹRÓDŁO POMINIĘTE");
+        return false;
+      }
+
+      return true;
     }
 
     async function refreshData() {
@@ -816,16 +1007,35 @@
         return;
       }
 
+      // Bez nakładających się odświeżeń. To usuwa wyścig, w którym wolniejsza,
+      // starsza odpowiedź kończyła się po nowszej i cofała ekran.
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+      const requestId = ++refreshSequence;
+
       try {
-        const records = await loadRecords();
-        state = { ...state, ...buildState(records) };
+        const loaded = await loadRecords(requestId);
+        const candidate = buildState(loaded.records);
+        candidate.sourceGid = loaded.gid;
+
+        if (!shouldAcceptCandidate(candidate, requestId, loaded.gid)) return;
+
+        state = {
+          ...state,
+          ...candidate,
+          selectedGid: loaded.gid,
+          sourceGid: loaded.gid
+        };
         applyDataToUI();
+        persistLastGoodState();
         setConnection(true, "DANE OK");
         hideMessage();
       } catch (error) {
         console.error(error);
-        setConnection(false, "BRAK DANYCH");
+        setConnection(false, state.dataReady ? "BŁĄD AKTUALIZACJI" : "BRAK DANYCH");
         showMessage(error.message || "Nie udało się pobrać danych z arkusza.");
+      } finally {
+        refreshInFlight = false;
       }
     }
 
@@ -914,8 +1124,10 @@
     }
 
     function setConnection(ok, text) {
+      const hideNormalSuccess = ok && text === "DANE OK";
+      ui.connection.classList.toggle("is-hidden", hideNormalSuccess);
       ui.connection.classList.toggle("offline", !ok);
-      ui.connectionText.textContent = text;
+      ui.connectionText.textContent = hideNormalSuccess ? "" : text;
     }
 
     function showMessage(text) {
@@ -953,6 +1165,7 @@
       if (document.visibilityState === "visible") requestWakeLock();
     });
 
+    restoreLastGoodState();
     applyDataToUI();
     refreshData();
     renderClock();
